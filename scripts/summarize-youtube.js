@@ -7,7 +7,7 @@
  * 3) PATCH 回原本那條 Discord 訊息
  */
 
-import { YoutubeTranscript } from "youtube-transcript";
+import { Innertube } from "youtubei.js";
 
 const {
   VIDEO_ID,
@@ -30,15 +30,17 @@ async function main() {
       throw new Error("缺 GEMINI_API_KEY 或 DISCORD_BOT_TOKEN");
     }
 
-    // 1) 抓字幕（多語言 fallback）
+    // 1) 抓字幕 + metadata（youtubei.js 一次到位）
     const transcript = await fetchTranscript(VIDEO_ID);
     console.log(
-      `[transcript] lang=${transcript.lang} auto=${transcript.isAuto} chars=${transcript.text.length} elapsed=${Date.now() - t0}ms`
+      `[transcript] lang=${transcript.lang} chars=${transcript.text.length} title="${transcript.title}" channel="${transcript.channel}" dur=${transcript.duration}s elapsed=${Date.now() - t0}ms`
     );
 
-    // 2) 影片 metadata
-    const meta = await fetchOembedMeta(VIDEO_ID);
-    console.log(`[meta] title="${meta.title}" channel="${meta.channel}"`);
+    // 2) metadata 已在 transcript 物件裡，直接用
+    const meta = {
+      title: transcript.title,
+      channel: transcript.channel,
+    };
 
     // 3) 呼叫 Gemini 整理
     const summary = await callGemini({
@@ -47,12 +49,12 @@ async function main() {
       videoId: VIDEO_ID,
       text: transcript.text,
       lang: transcript.lang,
-      isAuto: transcript.isAuto,
     });
     console.log(`[gemini] summary len=${summary.length} elapsed=${Date.now() - t0}ms`);
 
     // 4) PATCH 回 Discord
-    const header = `_📝 字幕模式 · ${transcript.lang}${transcript.isAuto ? "(自動)" : ""} · ${transcript.text.length.toLocaleString()}字_\n\n`;
+    const durMin = transcript.duration ? `${Math.round(transcript.duration / 60)}分 · ` : "";
+    const header = `_📝 字幕模式 · ${transcript.lang} · ${durMin}${transcript.text.length.toLocaleString()}字_\n\n`;
     const chunks = splitMessage(header + summary, 1900);
     await patchOriginal(chunks[0]);
     for (let i = 1; i < chunks.length; i++) {
@@ -75,71 +77,87 @@ async function main() {
   }
 }
 
-// ─────────── YouTube 字幕 ───────────
+// ─────────── YouTube 字幕（youtubei.js）───────────
 async function fetchTranscript(videoId) {
-  // 嘗試多個語言，人工字幕優先
-  const langs = ["zh-TW", "zh-Hant", "zh-CN", "zh-Hans", "zh", "en", "ja"];
+  // 初始化 Innertube client（library 自動處理 client 切換、PoT token 等）
+  const yt = await Innertube.create({
+    lang: "zh-TW",
+    location: "TW",
+    retrieve_player: false, // 我們只要 metadata + transcript，不需要播放 URL
+  });
 
-  // youtube-transcript 自動處理：先試 lang 然後 fallback 到 auto
-  let lastErr;
-  for (const lang of langs) {
-    try {
-      const parts = await YoutubeTranscript.fetchTranscript(videoId, { lang });
-      if (!parts || parts.length === 0) continue;
-      const text = parts
-        .map((p) => p.text || "")
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (text.length < 50) continue;
-      return { text, lang, isAuto: false };
-    } catch (e) {
-      lastErr = e;
-      // 繼續試下一個語言
-    }
+  // 抓影片基本資訊
+  const info = await yt.getInfo(videoId);
+  const basic = info.basic_info || {};
+
+  // 抓 transcript 物件
+  let transcriptInfo;
+  try {
+    transcriptInfo = await info.getTranscript();
+  } catch (e) {
+    throw new Error(`getTranscript 失敗：${e.message}`);
   }
 
-  // 不指定 lang 試一次（讓 lib 自動挑預設）
-  try {
-    const parts = await YoutubeTranscript.fetchTranscript(videoId);
-    if (parts && parts.length > 0) {
-      const text = parts
-        .map((p) => p.text || "")
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (text.length >= 50) {
-        return { text, lang: "default", isAuto: true };
+  if (!transcriptInfo) {
+    throw new Error("這支影片沒有 transcript 物件");
+  }
+
+  // 嘗試切換到中文（如果有的話），不行就保持預設
+  const availableLangs =
+    transcriptInfo.languages || transcriptInfo.transcript?.content?.body?.menu_items || [];
+  const preferred = ["zh-TW", "zh-Hant", "zh-CN", "zh-Hans", "zh", "繁體中文", "中文"];
+  let selectedLang = "default";
+  for (const want of preferred) {
+    const found = availableLangs.find((l) =>
+      (typeof l === "string" ? l : l.title || l.name || "")
+        .toLowerCase()
+        .includes(want.toLowerCase())
+    );
+    if (found) {
+      try {
+        transcriptInfo = await transcriptInfo.selectLanguage(
+          typeof found === "string" ? found : found.title || found.name
+        );
+        selectedLang = typeof found === "string" ? found : found.title || want;
+        break;
+      } catch {
+        // 切換失敗就繼續用原本的
       }
     }
-  } catch (e) {
-    lastErr = e;
   }
 
-  throw new Error(
-    `所有語言都抓不到字幕${lastErr ? `（${lastErr.message}）` : ""}`
-  );
-}
+  // 萃取 transcript 文字
+  const segments =
+    transcriptInfo?.transcript?.content?.body?.initial_segments || [];
 
-async function fetchOembedMeta(videoId) {
-  try {
-    const r = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
-    );
-    if (!r.ok) throw new Error(`oembed HTTP ${r.status}`);
-    const j = await r.json();
-    return {
-      title: j.title || "(未知標題)",
-      channel: j.author_name || "(未知頻道)",
-    };
-  } catch (e) {
-    console.error(`[oembed] failed: ${e.message}`);
-    return { title: "(未知標題)", channel: "(未知頻道)" };
+  const text = segments
+    .map((s) => {
+      // 各種可能的內部結構
+      if (s.snippet?.text) return s.snippet.text;
+      if (s.snippet?.runs) return s.snippet.runs.map((r) => r.text).join("");
+      if (typeof s.snippet === "string") return s.snippet;
+      return "";
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text || text.length < 50) {
+    throw new Error(`Transcript 為空或過短（${text.length} 字）`);
   }
+
+  return {
+    text,
+    lang: selectedLang,
+    title: basic.title || "(未知標題)",
+    channel: basic.author || basic.channel?.name || "(未知頻道)",
+    duration: basic.duration || 0,
+  };
 }
 
 // ─────────── Gemini ───────────
-async function callGemini({ title, channel, videoId, text, lang, isAuto }) {
+async function callGemini({ title, channel, videoId, text, lang }) {
   const durationHint = estimateDurationFromTranscript(text);
   const isLong = durationHint > 1800;
 
@@ -148,7 +166,7 @@ async function callGemini({ title, channel, videoId, text, lang, isAuto }) {
 【影片資訊】
 標題：${title}
 頻道：${channel}
-字幕：${isAuto ? "自動生成" : "人工"}（${lang}）
+字幕語言：${lang}
 字幕字數：${text.length}
 
 【輸出格式】
