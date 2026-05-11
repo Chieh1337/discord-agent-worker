@@ -27,9 +27,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
 
-      - run: npm install --omit=dev
+      - run: npm install --omit=dev --no-package-lock
 
       - name: Summarize video
         env:
