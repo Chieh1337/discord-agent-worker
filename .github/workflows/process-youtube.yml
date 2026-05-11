@@ -1,0 +1,41 @@
+name: Process YouTube
+
+# 由 Cloudflare Worker 透過 repository_dispatch 觸發
+on:
+  repository_dispatch:
+    types: [youtube]
+  # 也允許手動觸發（用於測試）
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "YouTube video ID（11 字元）"
+        required: true
+      application_id:
+        description: "Discord Application ID"
+        required: true
+      interaction_token:
+        description: "Discord Interaction Token"
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm install --omit=dev
+
+      - name: Summarize video
+        env:
+          VIDEO_ID: ${{ github.event.client_payload.video_id || github.event.inputs.video_id }}
+          APPLICATION_ID: ${{ github.event.client_payload.application_id || github.event.inputs.application_id }}
+          INTERACTION_TOKEN: ${{ github.event.client_payload.interaction_token || github.event.inputs.interaction_token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: node scripts/summarize-youtube.js

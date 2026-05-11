@@ -1,0 +1,16 @@
+{
+  "name": "discord-agent-worker",
+  "version": "0.1.0",
+  "description": "GitHub Actions worker for Discord AI bot — fetches YouTube transcripts (bypassing Cloudflare IP blocks) and processes via Gemini",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "summarize": "node scripts/summarize-youtube.js"
+  },
+  "dependencies": {
+    "youtube-transcript": "^1.2.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
