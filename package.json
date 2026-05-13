@@ -7,9 +7,7 @@
   "scripts": {
     "summarize": "node scripts/summarize-youtube.js"
   },
-  "dependencies": {
-    "youtubei.js": "^11.0.0"
-  },
+  "dependencies": {},
   "engines": {
     "node": ">=20"
   }

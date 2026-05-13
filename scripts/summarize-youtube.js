@@ -1,16 +1,15 @@
 /**
  * summarize-youtube.js
  *
- * 由 GitHub Action 觸發。從 env 拿 video_id + Discord interaction context，
- * 1) 抓字幕（GitHub IP，YouTube 不擋）
- * 2) 呼叫 Gemini 2.5 Flash 整理成繁中筆記
- * 3) PATCH 回原本那條 Discord 訊息
+ * GitHub Action 觸發。從 env 拿 video_id + Discord interaction context。
  *
- * 抓字幕策略：用 youtubei.js getInfo() 拿 caption tracks，
- *           然後自己 fetch baseUrl?fmt=json3（避開 buggy 的 getTranscript()）
+ * 抓字幕策略（依序試）：
+ *   1. watch page scrape — 簡單、從 GitHub IP 不會被 429
+ *   2. Innertube ANDROID — yt-dlp 用的客戶端
+ *   3. Innertube IOS     — 同上
+ *
+ * 不再用 youtubei.js（v11 對新 YouTube response 解析失敗，captions field 空）
  */
-
-import { Innertube } from "youtubei.js";
 
 const {
   VIDEO_ID,
@@ -35,13 +34,11 @@ async function main() {
       throw new Error("缺 GEMINI_API_KEY 或 DISCORD_BOT_TOKEN");
     }
 
-    // 1) 抓字幕 + metadata
     const transcript = await fetchTranscript(VIDEO_ID);
     console.log(
       `[transcript] lang=${transcript.lang} chars=${transcript.text.length} title="${transcript.title}" channel="${transcript.channel}" dur=${transcript.duration}s elapsed=${Date.now() - t0}ms`
     );
 
-    // 2) Gemini 整理
     const summary = await callGemini({
       title: transcript.title,
       channel: transcript.channel,
@@ -52,7 +49,6 @@ async function main() {
     });
     console.log(`[gemini] summary len=${summary.length} elapsed=${Date.now() - t0}ms`);
 
-    // 3) PATCH 回 Discord
     const durMin = transcript.duration ? `${Math.round(transcript.duration / 60)}分 · ` : "";
     const header = `_📝 字幕模式 · ${transcript.lang} · ${durMin}${transcript.text.length.toLocaleString()}字_\n\n`;
     const chunks = splitMessage(header + summary, 1900);
@@ -77,49 +73,157 @@ async function main() {
 }
 
 // ═══════════════════════════════════════
-// YouTube 字幕：getInfo() + 自抓 timedtext
+// 抓字幕：多策略 fallback
 // ═══════════════════════════════════════
 async function fetchTranscript(videoId) {
-  const yt = await Innertube.create({
-    lang: "zh-TW",
-    location: "TW",
-    retrieve_player: true, // 必須開，否則 captions 欄位是空的
-  });
+  const strategies = [
+    { name: "watch-page", fn: () => fetchViaWatchPage(videoId) },
+    { name: "innertube-ANDROID", fn: () => fetchViaInnertube(videoId, "ANDROID") },
+    { name: "innertube-IOS", fn: () => fetchViaInnertube(videoId, "IOS") },
+  ];
 
-  const info = await yt.getInfo(videoId);
-  const basic = info.basic_info || {};
+  let lastErr;
+  for (const { name, fn } of strategies) {
+    try {
+      const result = await fn();
+      console.log(`[transcript] strategy=${name} succeeded`);
+      return result;
+    } catch (e) {
+      console.log(`[transcript] strategy=${name} failed: ${e.message}`);
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("所有字幕策略都失敗");
+}
 
-  const tracks =
-    info.captions?.caption_tracks ||
-    info.captions?.captionTracks ||
-    [];
+// ── 策略 1：scrape watch page，取 ytInitialPlayerResponse
+async function fetchViaWatchPage(videoId) {
+  const t0 = Date.now();
+  const resp = await fetch(
+    `https://www.youtube.com/watch?v=${videoId}&hl=zh-TW&bpctr=9999999999&has_verified=1`,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+      },
+    }
+  );
+  if (!resp.ok) throw new Error(`watch HTTP ${resp.status}`);
+  const html = await resp.text();
+  console.log(`[watch] fetched ${Date.now() - t0}ms size=${html.length}`);
 
+  const m = html.match(
+    /ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\})\s*;\s*(?:var\s|<\/script>)/
+  );
+  if (!m) throw new Error("找不到 ytInitialPlayerResponse");
+  const pr = JSON.parse(m[1]);
+  return await extractFromPlayerResponse(pr);
+}
+
+// ── 策略 2/3：Innertube API（ANDROID / IOS）
+async function fetchViaInnertube(videoId, clientType) {
+  const t0 = Date.now();
+  const apiKeys = {
+    ANDROID: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+    IOS: "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
+  };
+  const clients = {
+    ANDROID: {
+      clientName: "ANDROID",
+      clientVersion: "19.45.36",
+      androidSdkVersion: 30,
+      osName: "Android",
+      osVersion: "11",
+      userAgent: "com.google.android.youtube/19.45.36 (Linux; U; Android 11) gzip",
+      headerClientName: "3",
+    },
+    IOS: {
+      clientName: "IOS",
+      clientVersion: "19.45.4",
+      deviceMake: "Apple",
+      deviceModel: "iPhone16,2",
+      osName: "iPhone",
+      osVersion: "18.1.0.22B83",
+      userAgent:
+        "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+      headerClientName: "5",
+    },
+  };
+  const c = clients[clientType];
+  const apiKey = apiKeys[clientType];
+
+  const clientCtx = {
+    clientName: c.clientName,
+    clientVersion: c.clientVersion,
+    hl: "zh-TW",
+    gl: "TW",
+    utcOffsetMinutes: 480,
+  };
+  if (c.androidSdkVersion) clientCtx.androidSdkVersion = c.androidSdkVersion;
+  if (c.deviceMake) clientCtx.deviceMake = c.deviceMake;
+  if (c.deviceModel) clientCtx.deviceModel = c.deviceModel;
+  if (c.osName) clientCtx.osName = c.osName;
+  if (c.osVersion) clientCtx.osVersion = c.osVersion;
+
+  const resp = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": c.userAgent,
+        "X-YouTube-Client-Name": c.headerClientName,
+        "X-YouTube-Client-Version": c.clientVersion,
+      },
+      body: JSON.stringify({
+        context: { client: clientCtx },
+        videoId,
+        contentCheckOk: true,
+        racyCheckOk: true,
+      }),
+    }
+  );
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(
+      `innertube HTTP ${resp.status}${body ? " body=" + body.slice(0, 200) : ""}`
+    );
+  }
+  const pr = await resp.json();
+  console.log(`[innertube:${clientType}] fetched ${Date.now() - t0}ms`);
+  return await extractFromPlayerResponse(pr);
+}
+
+// ── 從 player response 抓 captions、合併文字
+async function extractFromPlayerResponse(pr) {
+  const status = pr.playabilityStatus;
+  if (status?.status && status.status !== "OK") {
+    throw new Error(`不可播：${status.reason || status.status}`);
+  }
+
+  const tracks = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!tracks || tracks.length === 0) {
-    const capsDump = info.captions
-      ? JSON.stringify(info.captions).slice(0, 300)
-      : "(no captions field)";
-    console.log(`[transcript] no tracks. captions=${capsDump}`);
-    throw new Error("這支影片沒有可用字幕");
+    const dump = pr.captions ? JSON.stringify(pr.captions).slice(0, 200) : "(null)";
+    console.log(`[extract] no captionTracks. captions=${dump}`);
+    throw new Error("captions 為空");
   }
 
   console.log(
-    `[transcript] tracks: ${tracks
-      .map((t) => `${t.language_code || t.languageCode}${t.kind === "asr" ? "/auto" : ""}`)
+    `[extract] tracks: ${tracks
+      .map((t) => `${t.languageCode}${t.kind === "asr" ? "/auto" : ""}`)
       .join(", ")}`
   );
 
   const track = pickBestTrack(tracks);
-  const lang = track.language_code || track.languageCode || "unknown";
+  const lang = track.languageCode || "unknown";
   const isAuto = track.kind === "asr";
-  console.log(`[transcript] picked: ${lang}${isAuto ? "/auto" : ""}`);
 
-  const baseUrl = track.base_url || track.baseUrl;
-  if (!baseUrl) throw new Error("track 沒有 base_url");
-  const captionUrl = baseUrl + (baseUrl.includes("fmt=") ? "" : "&fmt=json3");
-  const capResp = await fetch(captionUrl);
-  if (!capResp.ok) {
-    throw new Error(`字幕內容 fetch 失敗：HTTP ${capResp.status}`);
-  }
+  const url =
+    track.baseUrl + (track.baseUrl.includes("fmt=") ? "" : "&fmt=json3");
+  const capResp = await fetch(url);
+  if (!capResp.ok) throw new Error(`caption fetch ${capResp.status}`);
   const capData = await capResp.json();
 
   const text = capData.events
@@ -133,29 +237,28 @@ async function fetchTranscript(videoId) {
     throw new Error(`字幕為空或過短（${text?.length || 0} 字）`);
   }
 
+  const v = pr.videoDetails || {};
   return {
     text,
     lang: `${lang}${isAuto ? "(自動)" : ""}`,
-    title: basic.title || "(未知標題)",
-    channel: basic.author || basic.channel?.name || "(未知頻道)",
-    duration: basic.duration || 0,
+    title: v.title || "(未知標題)",
+    channel: v.author || "(未知頻道)",
+    duration: Number(v.lengthSeconds) || 0,
   };
 }
 
 function pickBestTrack(tracks) {
   const preferred = ["zh-TW", "zh-Hant", "zh-CN", "zh-Hans", "zh", "en"];
   for (const lang of preferred) {
-    const t = tracks.find((tr) => {
-      const code = tr.language_code || tr.languageCode || "";
-      return code.startsWith(lang) && tr.kind !== "asr";
-    });
+    const t = tracks.find(
+      (tr) => (tr.languageCode || "").startsWith(lang) && tr.kind !== "asr"
+    );
     if (t) return t;
   }
   for (const lang of preferred) {
-    const t = tracks.find((tr) => {
-      const code = tr.language_code || tr.languageCode || "";
-      return code.startsWith(lang) && tr.kind === "asr";
-    });
+    const t = tracks.find(
+      (tr) => (tr.languageCode || "").startsWith(lang) && tr.kind === "asr"
+    );
     if (t) return t;
   }
   return tracks.find((tr) => tr.kind !== "asr") || tracks[0];
@@ -165,7 +268,7 @@ function pickBestTrack(tracks) {
 // Gemini
 // ═══════════════════════════════════════
 async function callGemini({ title, channel, videoId, text, lang, duration }) {
-  const isLong = (duration || estimateDurationFromTranscript(text)) > 1800;
+  const isLong = (duration || Math.round(text.length / 5)) > 1800;
 
   const prompt = `你是專業的學習筆記整理員。下面是一支 YouTube 影片的逐字稿，請整理成結構化的繁體中文學習筆記。
 
@@ -213,26 +316,16 @@ ${text}`;
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 4096,
-        },
+        generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
       }),
     }
   );
 
   const data = await r.json();
-  if (!r.ok) {
-    throw new Error(data.error?.message || `Gemini HTTP ${r.status}`);
-  }
+  if (!r.ok) throw new Error(data.error?.message || `Gemini HTTP ${r.status}`);
   const out = data.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!out) throw new Error("Gemini 回傳空內容");
   return out;
-}
-
-function estimateDurationFromTranscript(text) {
-  // 粗估：~5 字/秒
-  return Math.round(text.length / 5);
 }
 
 // ═══════════════════════════════════════
