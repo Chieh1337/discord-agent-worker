@@ -83,7 +83,7 @@ async function fetchTranscript(videoId) {
   const yt = await Innertube.create({
     lang: "zh-TW",
     location: "TW",
-    retrieve_player: false,
+    retrieve_player: true, // 必須開，否則 captions 欄位是空的
   });
 
   const info = await yt.getInfo(videoId);
