@@ -5,6 +5,9 @@
  * 1) 抓字幕（GitHub IP，YouTube 不擋）
  * 2) 呼叫 Gemini 2.5 Flash 整理成繁中筆記
  * 3) PATCH 回原本那條 Discord 訊息
+ *
+ * 抓字幕策略：用 youtubei.js getInfo() 拿 caption tracks，
+ *           然後自己 fetch baseUrl?fmt=json3（避開 buggy 的 getTranscript()）
  */
 
 import { Innertube } from "youtubei.js";
@@ -17,7 +20,9 @@ const {
   DISCORD_BOT_TOKEN,
 } = process.env;
 
-// ─────────── 主流程 ───────────
+// ═══════════════════════════════════════
+// Main
+// ═══════════════════════════════════════
 async function main() {
   console.log(`[start] video=${VIDEO_ID}`);
   const t0 = Date.now();
@@ -30,29 +35,24 @@ async function main() {
       throw new Error("缺 GEMINI_API_KEY 或 DISCORD_BOT_TOKEN");
     }
 
-    // 1) 抓字幕 + metadata（youtubei.js 一次到位）
+    // 1) 抓字幕 + metadata
     const transcript = await fetchTranscript(VIDEO_ID);
     console.log(
       `[transcript] lang=${transcript.lang} chars=${transcript.text.length} title="${transcript.title}" channel="${transcript.channel}" dur=${transcript.duration}s elapsed=${Date.now() - t0}ms`
     );
 
-    // 2) metadata 已在 transcript 物件裡，直接用
-    const meta = {
+    // 2) Gemini 整理
+    const summary = await callGemini({
       title: transcript.title,
       channel: transcript.channel,
-    };
-
-    // 3) 呼叫 Gemini 整理
-    const summary = await callGemini({
-      title: meta.title,
-      channel: meta.channel,
       videoId: VIDEO_ID,
       text: transcript.text,
       lang: transcript.lang,
+      duration: transcript.duration,
     });
     console.log(`[gemini] summary len=${summary.length} elapsed=${Date.now() - t0}ms`);
 
-    // 4) PATCH 回 Discord
+    // 3) PATCH 回 Discord
     const durMin = transcript.duration ? `${Math.round(transcript.duration / 60)}分 · ` : "";
     const header = `_📝 字幕模式 · ${transcript.lang} · ${durMin}${transcript.text.length.toLocaleString()}字_\n\n`;
     const chunks = splitMessage(header + summary, 1900);
@@ -67,7 +67,6 @@ async function main() {
     console.log(`[done] total=${Date.now() - t0}ms`);
   } catch (err) {
     console.error(`[FAIL] ${err.message}\n${err.stack}`);
-    // 嘗試把錯誤 PATCH 回 Discord
     try {
       await patchOriginal(`❌ 處理失敗：${err.message}`);
     } catch (e) {
@@ -77,89 +76,96 @@ async function main() {
   }
 }
 
-// ─────────── YouTube 字幕（youtubei.js）───────────
+// ═══════════════════════════════════════
+// YouTube 字幕：getInfo() + 自抓 timedtext
+// ═══════════════════════════════════════
 async function fetchTranscript(videoId) {
-  // 初始化 Innertube client（library 自動處理 client 切換、PoT token 等）
   const yt = await Innertube.create({
     lang: "zh-TW",
     location: "TW",
-    retrieve_player: false, // 我們只要 metadata + transcript，不需要播放 URL
+    retrieve_player: false,
   });
 
-  // 抓影片基本資訊
   const info = await yt.getInfo(videoId);
   const basic = info.basic_info || {};
 
-  // 抓 transcript 物件
-  let transcriptInfo;
-  try {
-    transcriptInfo = await info.getTranscript();
-  } catch (e) {
-    throw new Error(`getTranscript 失敗：${e.message}`);
+  const tracks =
+    info.captions?.caption_tracks ||
+    info.captions?.captionTracks ||
+    [];
+
+  if (!tracks || tracks.length === 0) {
+    const capsDump = info.captions
+      ? JSON.stringify(info.captions).slice(0, 300)
+      : "(no captions field)";
+    console.log(`[transcript] no tracks. captions=${capsDump}`);
+    throw new Error("這支影片沒有可用字幕");
   }
 
-  if (!transcriptInfo) {
-    throw new Error("這支影片沒有 transcript 物件");
+  console.log(
+    `[transcript] tracks: ${tracks
+      .map((t) => `${t.language_code || t.languageCode}${t.kind === "asr" ? "/auto" : ""}`)
+      .join(", ")}`
+  );
+
+  const track = pickBestTrack(tracks);
+  const lang = track.language_code || track.languageCode || "unknown";
+  const isAuto = track.kind === "asr";
+  console.log(`[transcript] picked: ${lang}${isAuto ? "/auto" : ""}`);
+
+  const baseUrl = track.base_url || track.baseUrl;
+  if (!baseUrl) throw new Error("track 沒有 base_url");
+  const captionUrl = baseUrl + (baseUrl.includes("fmt=") ? "" : "&fmt=json3");
+  const capResp = await fetch(captionUrl);
+  if (!capResp.ok) {
+    throw new Error(`字幕內容 fetch 失敗：HTTP ${capResp.status}`);
   }
+  const capData = await capResp.json();
 
-  // 嘗試切換到中文（如果有的話），不行就保持預設
-  const availableLangs =
-    transcriptInfo.languages || transcriptInfo.transcript?.content?.body?.menu_items || [];
-  const preferred = ["zh-TW", "zh-Hant", "zh-CN", "zh-Hans", "zh", "繁體中文", "中文"];
-  let selectedLang = "default";
-  for (const want of preferred) {
-    const found = availableLangs.find((l) =>
-      (typeof l === "string" ? l : l.title || l.name || "")
-        .toLowerCase()
-        .includes(want.toLowerCase())
-    );
-    if (found) {
-      try {
-        transcriptInfo = await transcriptInfo.selectLanguage(
-          typeof found === "string" ? found : found.title || found.name
-        );
-        selectedLang = typeof found === "string" ? found : found.title || want;
-        break;
-      } catch {
-        // 切換失敗就繼續用原本的
-      }
-    }
-  }
-
-  // 萃取 transcript 文字
-  const segments =
-    transcriptInfo?.transcript?.content?.body?.initial_segments || [];
-
-  const text = segments
-    .map((s) => {
-      // 各種可能的內部結構
-      if (s.snippet?.text) return s.snippet.text;
-      if (s.snippet?.runs) return s.snippet.runs.map((r) => r.text).join("");
-      if (typeof s.snippet === "string") return s.snippet;
-      return "";
-    })
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const text = capData.events
+    ?.filter((e) => e.segs)
+    ?.map((e) => e.segs.map((s) => s.utf8 || "").join(""))
+    ?.join(" ")
+    ?.replace(/\s+/g, " ")
+    ?.trim();
 
   if (!text || text.length < 50) {
-    throw new Error(`Transcript 為空或過短（${text.length} 字）`);
+    throw new Error(`字幕為空或過短（${text?.length || 0} 字）`);
   }
 
   return {
     text,
-    lang: selectedLang,
+    lang: `${lang}${isAuto ? "(自動)" : ""}`,
     title: basic.title || "(未知標題)",
     channel: basic.author || basic.channel?.name || "(未知頻道)",
     duration: basic.duration || 0,
   };
 }
 
-// ─────────── Gemini ───────────
-async function callGemini({ title, channel, videoId, text, lang }) {
-  const durationHint = estimateDurationFromTranscript(text);
-  const isLong = durationHint > 1800;
+function pickBestTrack(tracks) {
+  const preferred = ["zh-TW", "zh-Hant", "zh-CN", "zh-Hans", "zh", "en"];
+  for (const lang of preferred) {
+    const t = tracks.find((tr) => {
+      const code = tr.language_code || tr.languageCode || "";
+      return code.startsWith(lang) && tr.kind !== "asr";
+    });
+    if (t) return t;
+  }
+  for (const lang of preferred) {
+    const t = tracks.find((tr) => {
+      const code = tr.language_code || tr.languageCode || "";
+      return code.startsWith(lang) && tr.kind === "asr";
+    });
+    if (t) return t;
+  }
+  return tracks.find((tr) => tr.kind !== "asr") || tracks[0];
+}
+
+// ═══════════════════════════════════════
+// Gemini
+// ═══════════════════════════════════════
+async function callGemini({ title, channel, videoId, text, lang, duration }) {
+  const isLong = (duration || estimateDurationFromTranscript(text)) > 1800;
 
   const prompt = `你是專業的學習筆記整理員。下面是一支 YouTube 影片的逐字稿，請整理成結構化的繁體中文學習筆記。
 
@@ -225,12 +231,13 @@ ${text}`;
 }
 
 function estimateDurationFromTranscript(text) {
-  // 粗估：中文約 5 字/秒（口語）、英文約 2-3 字/秒
-  const hasCJK = /[一-鿿]/.test(text.slice(0, 500));
-  return Math.round(text.length / (hasCJK ? 5 : 5));
+  // 粗估：~5 字/秒
+  return Math.round(text.length / 5);
 }
 
-// ─────────── Discord ───────────
+// ═══════════════════════════════════════
+// Discord
+// ═══════════════════════════════════════
 async function patchOriginal(content) {
   const r = await fetch(
     `https://discord.com/api/v10/webhooks/${APPLICATION_ID}/${INTERACTION_TOKEN}/messages/@original`,
@@ -267,7 +274,9 @@ async function followUp(content) {
   }
 }
 
-// ─────────── Utils ───────────
+// ═══════════════════════════════════════
+// Utils
+// ═══════════════════════════════════════
 function splitMessage(text, maxLength = 1900) {
   if (text.length <= maxLength) return [text];
   const chunks = [];
