@@ -37,4 +37,6 @@ jobs:
           INTERACTION_TOKEN: ${{ github.event.client_payload.interaction_token || github.event.inputs.interaction_token }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+          WIKI_REPO: Chieh1337/personal-wiki
         run: node scripts/summarize-youtube.js

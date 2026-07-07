@@ -17,6 +17,8 @@ const {
   INTERACTION_TOKEN,
   GEMINI_API_KEY,
   DISCORD_BOT_TOKEN,
+  WIKI_PAT, // fine-grained PAT，只有 personal-wiki 的 Contents 讀寫權
+  WIKI_REPO, // 例：Chieh1337/personal-wiki
 } = process.env;
 
 // 預設 flash（免費額度可用）；要用 pro 時由 workflow 傳 GEMINI_MODEL 覆蓋
@@ -52,9 +54,16 @@ async function main() {
     for (let i = 1; i < chunks.length; i++) {
       await followUp(chunks[i]);
     }
-    await followUp(
-      "💾 **回覆此訊息 `/wiki-save` 將摘要存入個人知識庫**（Phase 2 功能）"
-    );
+    // 寫入 wiki repo 的 raw/inbox/（待本機 /wiki-absorb 吸收）
+    try {
+      const inboxPath = await commitToWikiInbox(summary, videoUrl);
+      await followUp(
+        `💾 已存入知識庫收件匣 \`${inboxPath}\`，回到電腦執行 \`/wiki-absorb\` 即可整合進 wiki。`
+      );
+    } catch (inboxErr) {
+      console.error(`[inbox] ${inboxErr.message}`);
+      await followUp(`⚠️ 摘要已生成，但寫入知識庫 inbox 失敗：${inboxErr.message}`);
+    }
 
     console.log(`[done] total=${Date.now() - t0}ms`);
   } catch (err) {
@@ -148,6 +157,57 @@ ${videoUrl}`;
     throw new Error("Gemini 回傳空內容");
   }
   return out;
+}
+
+// ═══════════════════════════════════════
+// Wiki inbox（GitHub Contents API，免 clone）
+// ═══════════════════════════════════════
+async function commitToWikiInbox(summary, videoUrl) {
+  if (!WIKI_PAT || !WIKI_REPO) {
+    throw new Error("未設定 WIKI_PAT / WIKI_REPO");
+  }
+
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19).replace(/:/g, "");
+  const path = `raw/inbox/${date}_${time}_yt-${VIDEO_ID}.md`;
+
+  const content = `---
+id: inbox-yt-${VIDEO_ID}
+date: ${date}
+source_type: discord-youtube
+source_url: "${videoUrl}"
+model: ${MODEL}
+status: pending
+---
+
+${summary}
+`;
+
+  const resp = await fetch(
+    `https://api.github.com/repos/${WIKI_REPO}/contents/${path}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${WIKI_PAT}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "discord-agent-worker",
+      },
+      body: JSON.stringify({
+        message: `inbox: YouTube 摘要 ${VIDEO_ID}`,
+        content: Buffer.from(content, "utf8").toString("base64"),
+      }),
+    }
+  );
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`GitHub PUT ${resp.status}: ${body.slice(0, 150)}`);
+  }
+
+  console.log(`[inbox] committed ${path}`);
+  return path;
 }
 
 // ═══════════════════════════════════════
