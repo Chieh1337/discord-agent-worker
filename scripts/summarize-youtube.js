@@ -19,7 +19,8 @@ const {
   DISCORD_BOT_TOKEN,
 } = process.env;
 
-const MODEL = "gemini-2.5-pro";
+// 預設 flash（免費額度可用）；要用 pro 時由 workflow 傳 GEMINI_MODEL 覆蓋
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 // ═══════════════════════════════════════
 // Main
@@ -121,6 +122,8 @@ ${videoUrl}`;
     generationConfig: {
       temperature: 0.3,
       maxOutputTokens: 8192,
+      // 低解析度取樣：影片 token 量降約 3 倍，摘要品質幾乎無損（聽覺內容不受影響）
+      mediaResolution: "MEDIA_RESOLUTION_LOW",
     },
   };
 
